@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty_state, analysis_bar, level_badge, status_badge %}
+{% block title %}Logs{% endblock %}
+{% block heading %}Logs{% endblock %}
+
+
+{% block content %}
+{% if not analysis %}
+  {{ empty_state("No log records yet", "Records appear here once log data has been analyzed.") }}
+{% else %}
+{{ analysis_bar(analysis, analyses, "/explorer") }}
+
+<section class="card">
+  <form class="filters" method="get" action="/explorer">
+    <input type="hidden" name="analysis_id" value="{{ analysis.id }}">
+    <input type="hidden" name="order" value="{{ order }}">
+    <div class="field grow">
+      <label for="q">Search text</label>
+      <input type="search" id="q" name="q" value="{{ filters.q }}" placeholder="Message, path or IP contains…">
+    </div>
+    <div class="field">
+      <label for="level">Level</label>
+      <select id="level" name="level">
+        <option value="">All levels</option>
+        {% for level in LOG_LEVELS %}<option value="{{ level }}" {{ 'selected' if filters.level == level }}>{{ level }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="ip">IP address</label>
+      <input type="text" id="ip" name="ip" value="{{ filters.ip }}" placeholder="exact address" list="ip-list">
+      <datalist id="ip-list">{% for row in analysis.summary.top_ips %}<option value="{{ row.ip }}">{% endfor %}</datalist>
+    </div>
+    <div class="field">
+      <label for="status">HTTP status</label>
+      <select id="status" name="status">
+        <option value="">Any status</option>
+        {% for c, label in [("2xx", "2xx · success"), ("3xx", "3xx · redirect"), ("4xx", "4xx · client error"), ("5xx", "5xx · server error")] %}
+        <option value="{{ c }}" {{ 'selected' if filters.status == c }}>{{ label }}</option>
+        {% endfor %}
+        {% for code in analysis.summary.status_counts %}<option value="{{ code }}" {{ 'selected' if filters.status == code }}>{{ code }} only</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="start">From</label>
+      <input type="datetime-local" id="start" name="start" step="1" value="{{ filters.start|input_time }}">
+      
+    </div>
+    <div class="field">
+      <label for="end">To</label>
+      <input type="datetime-local" id="end" name="end" step="1" value="{{ filters.end|input_time }}">
+    </div>
+    <div class="filter-actions">
+      <button class="btn btn-primary" type="submit">{{ icon("explorer") }} Search</button>
+      {% if filters.active %}
+      <a class="btn" href="/explorer?analysis_id={{ analysis.id }}">Clear filters</a>
+      {% endif %}
+    </div>
+  </form>
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <div>
+      <h2>{{ total|number }} matching record{{ "" if total == 1 else "s" }}</h2>
+      <p class="card-desc">
+        {% if filters.active %}Filtered by:
+          {% if filters.q %}<span class="tag">text "{{ filters.q }}"</span>{% endif %}
+          {% if filters.level %}<span class="tag">level {{ filters.level }}</span>{% endif %}
+          {% if filters.ip %}<span class="tag">IP {{ filters.ip }}</span>{% endif %}
+          {% if filters.status %}<span class="tag">status {{ filters.status }}</span>{% endif %}
+          {% if filters.start %}<span class="tag">from {{ filters.start|localtime }}</span>{% endif %}
+          {% if filters.end %}<span class="tag">to {{ filters.end|localtime }}</span>{% endif %}
+        {% else %}Showing all records.{% endif %}
+      </p>
+    </div>
+{% set sort_base = "/explorer?analysis_id=" ~ analysis.id ~ "&q=" ~ (filters.q|urlencode) ~ "&level=" ~ filters.level ~ "&ip=" ~ (filters.ip|urlencode) ~ "&status=" ~ filters.status ~ "&start=" ~ (filters.start|input_time|urlencode) ~ "&end=" ~ (filters.end|input_time|urlencode) %}
+    <div class="sort-toggle" role="group" aria-label="Sort order">
+      <a class="{{ 'active' if order == 'newest' }}" href="{{ sort_base }}&order=newest">Newest first</a>
+      <a class="{{ 'active' if order == 'oldest' }}" href="{{ sort_base }}&order=oldest">Oldest first</a>
+    </div>
+    {% if total %}<span class="muted small">Showing {{ ((page - 1) * per_page + 1)|number }}–{{ [page * per_page, total]|min|number }}</span>{% endif %}
+  </div>
+  {% if rows %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Time</th><th>IP address</th><th>Level</th><th>Request</th><th>Status</th><th>Message</th><th class="num">Line</th></tr></thead>
+      <tbody>
+      {% for e in rows %}
+        <tr>
+          <td class="mono nowrap">{{ e.timestamp|localtime }}</td>
+          <td class="mono">{% if e.ip %}<a class="link-quiet" href="/explorer?analysis_id={{ analysis.id }}&ip={{ e.ip|urlencode }}" title="Show only this IP address">{{ e.ip }}</a>{% else %}-{% endif %}</td>
+          <td>{{ level_badge(e.level) }}</td>
+          <td class="mono truncate" title="{{ (e.method ~ ' ' ~ e.endpoint) if e.endpoint else '' }}">{% if e.endpoint %}<span class="muted">{{ e.method }}</span> {{ e.endpoint }}{% else %}-{% endif %}</td>
+          <td>{{ status_badge(e.status) }}</td>
+          <td class="truncate wide" title="{{ e.message }}">{{ e.message }}</td>
+          <td class="num muted mono">{{ e.line_number }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="muted small">Times are shown in {{ timezone_label() }}. "Line" is the line number in the original file.</p>
+  {% if pages > 1 %}
+  {% set base = "/explorer?analysis_id=" ~ analysis.id ~ "&q=" ~ (filters.q|urlencode) ~ "&level=" ~ filters.level ~ "&ip=" ~ (filters.ip|urlencode) ~ "&status=" ~ filters.status ~ "&start=" ~ (filters.start|input_time|urlencode) ~ "&end=" ~ (filters.end|input_time|urlencode) ~ "&order=" ~ order %}
+  <nav class="pagination" aria-label="Pages">
+    {% if page > 1 %}<a class="btn btn-sm" href="{{ base }}&page=1">First</a><a class="btn btn-sm" href="{{ base }}&page={{ page - 1 }}">‹ Previous</a>{% endif %}
+    <span>Page {{ page }} of {{ pages|number }}</span>
+    {% if page < pages %}<a class="btn btn-sm" href="{{ base }}&page={{ page + 1 }}">Next ›</a><a class="btn btn-sm" href="{{ base }}&page={{ pages }}">Last</a>{% endif %}
+  </nav>
+  {% endif %}
+  {% else %}
+  <p class="muted">No records match these filters. Try removing one of them.</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

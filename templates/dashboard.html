@@ -1,0 +1,228 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, analysis_bar, level_badge, status_badge, severity_badge, state_badge %}
+{% block title %}Dashboard{% endblock %}
+{% block heading %}Dashboard{% endblock %}
+
+{% block content %}
+{% set ms = monitor_status %}
+{# ---------------- System status ---------------- #}
+<section class="system-status" data-monitor-status data-analysis-id="{{ analysis.id if analysis else '' }}" data-analysis-total="{{ analysis.total_entries if analysis else '' }}">
+  <div class="system-status-main">
+    <span data-field="state_badge">{{ state_badge(ms.state) }}</span>
+    <div class="system-status-text">
+      {% if ms.state == "stopped" %}
+        <strong>Folder monitoring is off</strong>
+        <span class="muted">Watch a log folder to analyze new entries automatically.</span>
+      {% else %}
+        <strong class="mono" title="{{ ms.directory }}">{{ ms.directory }}</strong>
+        <span class="muted">
+          <span data-field="files_count">{{ ms.files|length }}</span> files ·
+          <span data-field="total_records">{{ ms.total_records|number }}</span> records ·
+          last scan <span data-field="last_scan_at">{{ ms.last_scan_at or "pending" }}</span> ·
+          last new data <span data-field="last_data_at">{{ ms.last_data_at or "none yet" }}</span>
+        </span>
+      {% endif %}
+      <span class="status-error" data-field="last_error" {{ 'hidden' if not ms.last_error }}>{{ ms.last_error or "" }}</span>
+    </div>
+  </div>
+  <a class="btn btn-sm" href="/monitor">{{ "Set up" if ms.state == "stopped" else "Manage" }}</a>
+</section>
+
+{% if ms.files %}
+<section class="card folder-overview">
+  <div class="card-head">
+    <h2>Monitored files</h2>
+    <span class="muted small">{{ ms.total_records|number }} records · {{ ms.total_errors|number }} errors · {{ ms.total_warnings|number }} warnings · {{ ms.total_findings|number }} findings</span>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>File</th><th>Status</th><th class="num">Records</th><th class="num">Errors</th><th class="num">Warnings</th><th class="num">Findings</th><th>Last new data</th></tr></thead>
+      <tbody>
+      {% for f in ms.files %}
+        <tr class="{{ 'row-selected' if analysis and f.analysis_id == analysis.id }}">
+          <td>{% if f.analysis_id %}<a class="link" href="/?analysis_id={{ f.analysis_id }}">{{ f.name }}</a>{% else %}{{ f.name }}{% endif %}</td>
+          <td><span class="file-status fs-{{ f.status }}">{{ f.status }}</span></td>
+          <td class="num">{{ f.records|number }}</td>
+          <td class="num {{ 'text-error' if f.errors }}">{{ f.errors|number }}</td>
+          <td class="num {{ 'text-warning' if f.warnings }}">{{ f.warnings|number }}</td>
+          <td class="num">{% if f.findings and f.analysis_id %}<a class="pill" href="/events?analysis_id={{ f.analysis_id }}">{{ f.findings }}</a>{% else %}{{ f.findings }}{% endif %}</td>
+          <td class="mono nowrap">{{ f.last_data_at or "-" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+{% if not analysis %}
+<div class="empty">
+  <h2>No log data yet</h2>
+  <p>Monitor a folder or upload a log file to see errors, warnings and findings here.</p>
+  <div class="empty-actions">
+    <a class="btn btn-primary" href="/monitor">{{ icon("folder") }} Monitor a folder</a>
+    <a class="btn" href="/upload">{{ icon("upload") }} Upload a file</a>
+    <a class="btn" href="/generate">{{ icon("generate") }} Sample data</a>
+  </div>
+</div>
+{% else %}
+{% set s = analysis.summary %}
+{% set lc = s.level_counts %}
+{% set total = analysis.total_entries %}
+
+{{ analysis_bar(analysis, analyses, "/") }}
+<div class="alert alert-info new-data" data-new-data hidden>New records have arrived for this file. <a class="link" href="/?analysis_id={{ analysis.id }}">Refresh</a></div>
+
+<section class="kpis" aria-label="Key numbers">
+  <a class="kpi" href="/explorer?analysis_id={{ analysis.id }}">
+    <span class="kpi-label">Records</span>
+    <span class="kpi-value">{{ total|number }}</span>
+    <span class="kpi-note">{% if analysis.invalid_lines %}{{ analysis.invalid_lines|number }} unreadable lines skipped{% else %}{{ s.unique_ips|number }} IP addresses{% endif %}</span>
+  </a>
+  <a class="kpi {{ 'kpi-error' if lc.ERROR + lc.CRITICAL }}" href="/explorer?analysis_id={{ analysis.id }}&level=ERROR">
+    <span class="kpi-label">Errors</span>
+    <span class="kpi-value">{{ (lc.ERROR + lc.CRITICAL)|number }}</span>
+    <span class="kpi-note">{{ lc.CRITICAL|number }} critical · {{ analysis.error_rate }}% of records</span>
+  </a>
+  <a class="kpi {{ 'kpi-warn' if lc.WARNING }}" href="/explorer?analysis_id={{ analysis.id }}&level=WARNING">
+    <span class="kpi-label">Warnings</span>
+    <span class="kpi-value">{{ lc.WARNING|number }}</span>
+    <span class="kpi-note">{{ percent(lc.WARNING, total) }}% of records</span>
+  </a>
+  <a class="kpi {{ 'kpi-error' if analysis.detection_count }}" href="/events?analysis_id={{ analysis.id }}">
+    <span class="kpi-label">Findings</span>
+    <span class="kpi-value">{{ analysis.detection_count|number }}</span>
+    <span class="kpi-note">suspicious patterns · {{ recurring|length }}{{ "+" if recurring|length == 5 }} recurring issues</span>
+  </a>
+</section>
+
+<div class="grid-2">
+  <section class="card">
+    <div class="card-head">
+      <h2>Suspicious patterns</h2>
+      <a class="link small" href="/events?analysis_id={{ analysis.id }}">All findings →</a>
+    </div>
+    {% if detections %}
+    <ul class="attention-list">
+      {% for d in detections %}
+      <li>
+        {{ severity_badge(d.severity) }}
+        <div class="attention-text"><strong>{{ d.title }}</strong><span>{{ d|summary }}</span></div>
+        <a class="btn btn-sm" href="/events?analysis_id={{ analysis.id }}#event-{{ d.id }}" aria-label="Details">{{ icon("arrow") }}</a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="all-clear">{{ icon("check") }}<span>No detection rule was triggered.</span></div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Recurring issues</h2>
+      <a class="link small" href="/events?analysis_id={{ analysis.id }}#recurring">All issues →</a>
+    </div>
+    {% if recurring %}
+    <ul class="attention-list">
+      {% for g in recurring %}
+      <li>
+        {{ level_badge(g.level) }}
+        <div class="attention-text"><strong class="mono-text" title="{{ g.pattern }}">{{ g.pattern|truncate(70, True) }}</strong><span>{{ g.count|number }}× · last {{ g.last_seen|localtime("%d %b %H:%M:%S") }}</span></div>
+        <a class="btn btn-sm" href="/explorer?analysis_id={{ analysis.id }}&level={{ g.level }}{% if g.search %}&q={{ g.search|urlencode }}{% endif %}" aria-label="Show records">{{ icon("arrow") }}</a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="all-clear">{{ icon("check") }}<span>No warning or error occurred more than once.</span></div>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card">
+  <div class="card-head">
+    <h2>Activity</h2>
+    <div class="legend"><span class="dot dot-total"></span>All records <span class="dot dot-error"></span>Errors</div>
+  </div>
+  {% if s.timeline %}
+  <div class="chart" id="timeline-chart" data-timezone="{{ TIMEZONE_NAME }}" data-explorer="/explorer?analysis_id={{ analysis.id }}" role="img" aria-label="Log records over time"></div>
+  <script type="application/json" id="timeline-data">{{ s.timeline|tojson }}</script>
+  <p class="chart-foot muted">{{ s.start_time|localtime }} → {{ s.end_time|localtime }} · click a point to open those records</p>
+  {% else %}<p class="muted">No timestamps yet.</p>{% endif %}
+</section>
+
+<div class="grid-3">
+  <section class="card">
+    <h2 class="card-title">Log levels</h2>
+    <ul class="bars">
+      {% for level in LOG_LEVELS %}
+      <li>
+        <a href="/explorer?analysis_id={{ analysis.id }}&level={{ level }}" class="bar-label">{{ level_badge(level) }}</a>
+        <div class="bar-track"><div class="bar-fill fill-{{ level|lower }}" style="width: {{ percent(lc[level], total) }}%"></div></div>
+        <span class="bar-value">{{ lc[level]|number }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2 class="card-title">HTTP status</h2>
+    {% if s.status_counts %}
+    {% set max_status = s.status_counts.values()|max %}
+    <ul class="bars">
+      {% for code, count in s.status_counts.items() %}
+      <li>
+        <a href="/explorer?analysis_id={{ analysis.id }}&status={{ code }}" class="bar-label">{{ status_badge(code|int) }}</a>
+        <div class="bar-track"><div class="bar-fill s{{ code[0] }}xx" style="width: {{ (count / max_status * 100)|round(1) }}%"></div></div>
+        <span class="bar-value">{{ count|number }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">No HTTP status codes in this log.</p>{% endif %}
+  </section>
+
+  <section class="card">
+    <h2 class="card-title">Top IP addresses</h2>
+    {% if s.top_ips %}
+    {% set max_ip = s.top_ips[0].count %}
+    <ul class="bars">
+      {% for row in s.top_ips[:6] %}
+      <li>
+        <a href="/explorer?analysis_id={{ analysis.id }}&ip={{ row.ip|urlencode }}" class="bar-label mono">{{ row.ip }}</a>
+        <div class="bar-track"><div class="bar-fill accent" style="width: {{ (row.count / max_ip * 100)|round(1) }}%"></div></div>
+        <span class="bar-value">{{ row.count|number }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">No IP addresses in this log.</p>{% endif %}
+  </section>
+</div>
+
+<section class="card">
+  <div class="card-head">
+    <h2>Recent activity</h2>
+    <a class="link small" href="/explorer?analysis_id={{ analysis.id }}">All logs →</a>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Time</th><th>Level</th><th>IP address</th><th>Request / message</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for e in recent %}
+        <tr>
+          <td class="mono nowrap">{{ e.timestamp|localtime }}</td>
+          <td>{{ level_badge(e.level) }}</td>
+          <td class="mono">{{ e.ip or "-" }}</td>
+          <td class="truncate wide">{{ (e.method ~ " " ~ e.endpoint) if e.endpoint else e.message }}</td>
+          <td>{{ status_badge(e.status) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/charts.js?v={{ ASSET_VERSION }}"></script>
+<script src="/static/js/monitor.js?v={{ ASSET_VERSION }}"></script>
+{% endblock %}

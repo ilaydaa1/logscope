@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, analysis_tabs %}
+{% block title %}Upload File{% endblock %}
+{% block heading %}Log Analysis{% endblock %}
+
+{% block content %}
+{{ analysis_tabs("upload") }}
+<div class="grid-2">
+  <section class="card">
+    <h2 class="card-title">Upload a log file</h2>
+    <form method="post" action="/upload" enctype="multipart/form-data" class="upload-form" id="upload-form">
+      <label class="dropzone" id="dropzone">
+        <input type="file" name="file" id="file-input" accept=".log,.txt,text/plain" required>
+        <span class="dropzone-icon">{{ icon("upload") }}</span>
+        <strong id="file-name">Choose a file or drag it here</strong>
+        <span class="muted">.log or .txt · up to {{ max_mb }} MB</span>
+      </label>
+      <div class="field">
+        <label for="timezone">Timestamps without a zone are in</label>
+        <select id="timezone" name="timezone">
+          {% for value, label in source_timezones.items() %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+        </select>
+      </div>
+      <button class="btn btn-primary btn-block" type="submit" id="upload-btn">{{ icon("upload") }} Upload and analyze</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2 class="card-title">Supported formats</h2>
+    <h3>Application access log</h3>
+    <pre class="code">2026-11-11T14:23:01Z WARNING 203.0.113.7 POST /login 401 - Failed login for user "admin"</pre>
+    <h3>Apache / Nginx (common or combined)</h3>
+    <pre class="code">203.0.113.7 - - [11/Nov/2026:14:23:01 +0000] "GET /index.html HTTP/1.1" 200 512 "-" "curl/8.0"</pre>
+    <h3>Application log</h3>
+    <pre class="code">2026-11-11 14:23:01,123 ERROR Database connection lost</pre>
+    <p class="muted small">Other lines are skipped and counted as unreadable. Files are only read as text, never executed.</p>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    const input = document.getElementById("file-input");
+    const zone = document.getElementById("dropzone");
+    const label = document.getElementById("file-name");
+    const show = () => { if (input.files.length) label.textContent = input.files[0].name; };
+    input.addEventListener("change", show);
+    ["dragenter", "dragover"].forEach(t => zone.addEventListener(t, e => { e.preventDefault(); zone.classList.add("drag"); }));
+    ["dragleave", "drop"].forEach(t => zone.addEventListener(t, () => zone.classList.remove("drag")));
+    zone.addEventListener("drop", e => { e.preventDefault(); input.files = e.dataTransfer.files; show(); });
+    document.getElementById("upload-form").addEventListener("submit", () => {
+      const btn = document.getElementById("upload-btn"); btn.disabled = true; btn.textContent = "Analyzing…";
+    });
+  })();
+</script>
+{% endblock %}

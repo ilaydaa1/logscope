@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty_state, analysis_bar %}
+{% block title %}Reports{% endblock %}
+{% block heading %}Reports{% endblock %}
+
+
+{% block content %}
+{% if not analysis %}
+  {{ empty_state("No report available yet", "Reports are built from analyzed log data.") }}
+{% else %}
+{{ analysis_bar(analysis, analyses, "/reports") }}
+
+<section class="card">
+  <div class="card-head">
+    <div>
+      <h2>Download report</h2>
+      <p class="card-desc">Includes the summary, log levels, HTTP responses, top IP addresses, {{ detection_count }} suspicious pattern{{ "" if detection_count == 1 else "s" }} with explanations, and the rules used.</p>
+    </div>
+    <div class="actions">
+      <a class="btn btn-primary" href="/reports/{{ analysis.id }}/download?format=txt">{{ icon("download") }} Download TXT</a>
+      <a class="btn" href="/reports/{{ analysis.id }}/download?format=csv">{{ icon("download") }} Download CSV</a>
+    </div>
+  </div>
+
+  <dl class="time-facts">
+    <div>
+      <dt>Report generated</dt>
+      <dd>{{ generated_at|localtime }}</dd>
+      <span class="muted small">The moment the report is created. Downloads use the time you click.</span>
+    </div>
+    <div>
+      <dt>Analysis created</dt>
+      <dd>{{ analysis.created_at|localtime }}</dd>
+      <span class="muted small">When this data was uploaded or generated and analyzed.</span>
+    </div>
+    <div>
+      <dt>Log period (events)</dt>
+      <dd>{{ analysis.summary.start_time|localtime }} → {{ analysis.summary.end_time|localtime }}</dd>
+      <span class="muted small">First and last timestamp inside the analyzed log.</span>
+    </div>
+  </dl>
+  <p class="muted small">All times are in {{ timezone_label(generated_at) }}.</p>
+</section>
+
+<section class="card">
+  <h2>Preview</h2>
+  <p class="card-desc">This is what the TXT report contains.</p>
+  <pre class="report-preview">{{ preview }}</pre>
+</section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, analysis_tabs %}
+{% block title %}Sample Data{% endblock %}
+{% block heading %}Log Analysis{% endblock %}
+
+{% block content %}
+{{ analysis_tabs("generate") }}
+<form method="post" action="/generate" class="generate-form">
+  <section class="card">
+    <div class="card-head">
+      <h2>Generate test data</h2>
+      <span class="muted small">Synthetic records for testing rules and reports; not real events.</span>
+    </div>
+    <div class="scenario-grid">
+      {% for key, sc in scenarios.items() %}
+      <label class="scenario">
+        <input type="radio" name="scenario" value="{{ key }}" {{ 'checked' if key == 'mixed' }}>
+        <span class="scenario-body">
+          <strong>{{ sc.label|replace(" (recommended)", "") }}</strong>
+          <span>{{ sc.description }}</span>
+          <em>Expected: {{ sc.expect }}</em>
+        </span>
+      </label>
+      {% endfor %}
+    </div>
+
+    <div class="form-row">
+      <div class="field">
+        <label for="count">Records ({{ min_entries|number }}–{{ max_entries|number }})</label>
+        <input type="number" id="count" name="count" min="{{ min_entries }}" max="{{ max_entries }}" value="1000" required>
+        <div class="chips">
+          {% for p in presets %}<button type="button" class="chip" onclick="document.getElementById('count').value={{ p }}">{{ p|number }}</button>{% endfor %}
+        </div>
+      </div>
+      <div class="field">
+        <label for="seed">Seed (optional)</label>
+        <input type="number" id="seed" name="seed" placeholder="Same seed = same events">
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-primary" type="submit" name="action" value="analyze">{{ icon("generate") }} Generate and analyze</button>
+      <button class="btn" type="submit" name="action" value="download">{{ icon("download") }} Download .log file</button>
+    </div>
+  </section>
+</form>
+{% endblock %}

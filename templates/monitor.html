@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, analysis_tabs, state_badge %}
+{% block title %}Log Analysis{% endblock %}
+{% block heading %}Log Analysis{% endblock %}
+
+{% block content %}
+{{ analysis_tabs("monitor") }}
+{% set st = status %}
+
+{% if st.state != "stopped" %}
+<section class="card monitor-panel" data-monitor-status data-monitor-page>
+  <div class="card-head">
+    <div class="monitor-heading">
+      <span data-field="state_badge">{{ state_badge(st.state) }}</span>
+      {% if st.state != "stopped" %}<strong class="mono monitor-dir" title="{{ st.directory }}">{{ st.directory }}</strong>{% endif %}
+    </div>
+    {% if st.state != "stopped" %}
+    <div class="actions">
+      {% if st.state == "running" %}
+      <form method="post" action="/monitor/scan"><button class="btn" type="submit">{{ icon("refresh") }} Scan now</button></form>
+      <form method="post" action="/monitor/pause"><button class="btn" type="submit">{{ icon("pause") }} Pause</button></form>
+      {% else %}
+      <form method="post" action="/monitor/resume"><button class="btn btn-primary" type="submit">{{ icon("play") }} Resume</button></form>
+      {% endif %}
+      <form method="post" action="/monitor/stop" onsubmit="return confirm('Stop monitoring and withdraw access to this folder? Existing analyses are kept.');">
+        <button class="btn btn-danger" type="submit">{{ icon("stop") }} Stop</button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+
+  {% if st.state != "stopped" %}
+  <dl class="stat-row">
+    <div><dt>Files</dt><dd data-field="files_count">{{ st.files|length }}</dd></div>
+    <div><dt>Records</dt><dd data-field="total_records">{{ st.total_records|number }}</dd></div>
+    <div><dt>Last scan</dt><dd data-field="last_scan_at">{{ st.last_scan_at or "pending" }}</dd></div>
+    <div><dt>Last new data</dt><dd data-field="last_data_at">{{ st.last_data_at or "none yet" }}</dd></div>
+    <div><dt>Interval</dt><dd>{{ st.interval|int }} s</dd></div>
+  </dl>
+  <p class="status-error" data-field="last_error" {{ 'hidden' if not st.last_error }}>{{ st.last_error or "" }}</p>
+  {% if st.synced_folder %}
+  <p class="status-warning">This folder is synced by OneDrive. Online-only files are downloaded when read, and sync can rewrite files. LogScope detects rewrites and does not read lines twice, but a local folder outside OneDrive is more reliable.</p>
+  {% endif %}
+  {% if st.state == "running" and not st.worker_alive %}
+  <p class="status-error">The background monitor is not running in this process. Use "Scan now" or restart LogScope.</p>
+  {% endif %}
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>File</th><th>Status</th><th class="num">Size</th><th>Read</th><th class="num">Records</th><th class="num">Findings</th><th>Last new data</th></tr></thead>
+      <tbody data-files>
+      {% for f in st.files %}
+        <tr>
+          <td>{% if f.analysis_id %}<a class="link" href="/?analysis_id={{ f.analysis_id }}">{{ f.name }}</a>{% else %}{{ f.name }}{% endif %}
+            {% if f.message %}<br><span class="muted small">{{ f.message }}</span>{% endif %}</td>
+          <td><span class="file-status fs-{{ f.status }}">{{ f.status }}</span></td>
+          <td class="num">{{ f.size|filesize }}</td>
+          <td><div class="progress"><div style="width: {{ f.progress }}%"></div></div><span class="muted small">{{ f.progress }}%</span></td>
+          <td class="num">{{ f.records|number }}</td>
+          <td class="num">{{ f.findings }}</td>
+          <td class="mono nowrap">{{ f.last_data_at or "-" }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="muted">No .log or .txt files in this folder yet. New files appear here automatically.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if st.state == "stopped" %}
+<section class="card">
+  <h2 class="card-title">Monitor a folder</h2>
+  <form method="post" action="/monitor/start" class="form-grid">
+    <div class="field span-2">
+      <label for="directory">Folder path</label>
+      <input type="text" id="directory" name="directory" value="{{ form.directory }}" placeholder="C:\logs\myapp  or  /var/log/myapp" required autocomplete="off">
+      <span class="hint">Full path. Only .log and .txt files directly in this folder are read (no sub-folders).</span>
+    </div>
+    <div class="field">
+      <label for="timezone">Timestamps without a zone are in</label>
+      <select id="timezone" name="timezone">
+        {% for value, label in source_timezones.items() %}<option value="{{ value }}" {{ 'selected' if form.timezone == value }}>{{ label }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="include_existing">Existing content</label>
+      <select id="include_existing" name="include_existing">
+        <option value="1" {{ 'selected' if form.include_existing }}>Analyze existing lines too</option>
+        <option value="" {{ 'selected' if not form.include_existing }}>Only new lines from now on</option>
+      </select>
+    </div>
+    <label class="checkbox span-2"><input type="checkbox" name="consent" value="1" required> I allow LogScope to read the log files in this folder.</label>
+    <div class="span-2"><button class="btn btn-primary" type="submit">{{ icon("play") }} Start monitoring</button></div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}<script src="/static/js/monitor.js?v={{ ASSET_VERSION }}"></script>{% endblock %}

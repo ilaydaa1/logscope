@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty_state, analysis_bar, severity_badge, level_badge, status_badge %}
+{% block title %}Findings{% endblock %}
+{% block heading %}Findings{% endblock %}
+
+{% block content %}
+{% if not analysis %}
+  {{ empty_state("No findings yet", "Findings appear once log data has been analyzed.") }}
+{% else %}
+{{ analysis_bar(analysis, analyses, "/events") }}
+
+{% set lc = analysis.summary.level_counts %}
+<dl class="stat-row stat-cards">
+  <div><dt>Suspicious patterns</dt><dd>{{ detections|length }}</dd></div>
+  <div><dt>Recurring issues</dt><dd>{{ recurring|length }}</dd></div>
+  <div><dt>Errors</dt><dd>{{ (lc.ERROR + lc.CRITICAL)|number }}</dd></div>
+  <div><dt>Warnings</dt><dd>{{ lc.WARNING|number }}</dd></div>
+</dl>
+
+<section class="card">
+  <div class="card-head">
+    <h2>Suspicious patterns</h2>
+    <span class="muted small" title="Low: reached the limit · Medium: 2× · High: 4× or more">Rule-based · severity relative to the limit</span>
+  </div>
+  {% if detections %}
+  <div class="event-list">
+    {% for d in detections %}
+    {% set guide = RULE_GUIDE[d.rule] %}
+    <article class="event sev-border-{{ d.severity }}" id="event-{{ d.id }}">
+      <header>
+        {{ severity_badge(d.severity) }}
+        <h3>{{ d.title }}</h3>
+        <span class="mono muted">{{ d.ip or "all clients" }}</span>
+      </header>
+      <p class="event-summary">{{ d|summary }}.</p>
+      <dl class="event-details">
+        <div><dt>Rule</dt><dd>{{ guide.matches|capitalize }}: <strong>{{ d.threshold }} or more within {{ d.window_seconds|duration }}</strong>. Peak {{ d.count|number }}, {{ d.total_matches|number }} in total.</dd></div>
+        <div><dt>When</dt><dd class="mono">{{ d.first_seen|localtime }} → {{ d.last_seen|localtime("%H:%M:%S") }}</dd></div>
+        <div><dt>Suggested check</dt><dd>{{ guide.advice }}</dd></div>
+      </dl>
+      {% set window = "&start=" ~ (d.first_seen|input_time|urlencode) ~ "&end=" ~ (d.last_seen|input_time|urlencode) %}
+      {% set match = {"brute_force": "&status=4xx&q=login", "excessive_404": "&status=404", "high_volume": "", "server_error_spike": "&status=5xx"}[d.rule] %}
+      {% set label = {"brute_force": "failed logins", "excessive_404": "404 responses", "high_volume": "requests", "server_error_spike": "server errors"}[d.rule] %}
+      <div class="event-links">
+        <a class="btn btn-sm" href="/explorer?analysis_id={{ analysis.id }}{% if d.ip %}&ip={{ d.ip|urlencode }}{% endif %}{{ match }}{{ window }}">View the {{ d.count|number }} {{ label }} in this window {{ icon("arrow") }}</a>
+        {% if d.ip %}<a class="link small" href="/explorer?analysis_id={{ analysis.id }}&ip={{ d.ip|urlencode }}">All records from {{ d.ip }}</a>{% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="all-clear">{{ icon("check") }}<span>No detection rule was triggered.</span></div>
+  {% endif %}
+</section>
+
+<section class="card" id="recurring">
+  <div class="card-head">
+    <h2>Recurring issues</h2>
+    <span class="muted small">Warnings and errors that occur more than once (numbers and quoted values ignored)</span>
+  </div>
+  {% if recurring %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Level</th><th>Message</th><th>Status</th><th class="num">Count</th><th class="num">IPs</th><th>First seen</th><th>Last seen</th><th></th></tr></thead>
+      <tbody>
+      {% for g in recurring %}
+        <tr>
+          <td>{{ level_badge(g.level) }}</td>
+          <td class="truncate mono-text" title="{{ g.example }}">{{ g.pattern }}</td>
+          <td>{{ status_badge(g.status) }}</td>
+          <td class="num"><strong>{{ g.count|number }}</strong></td>
+          <td class="num">{{ g.ip_count }}</td>
+          <td class="mono nowrap">{{ g.first_seen|localtime("%d %b %H:%M:%S") }}</td>
+          <td class="mono nowrap">{{ g.last_seen|localtime("%d %b %H:%M:%S") }}</td>
+          <td><a class="btn btn-sm" href="/explorer?analysis_id={{ analysis.id }}&level={{ g.level }}{% if g.status %}&status={{ g.status }}{% endif %}{% if g.search %}&q={{ g.search|urlencode }}{% endif %}">View</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="all-clear">{{ icon("check") }}<span>No warning or error occurred more than once.</span></div>
+  {% endif %}
+</section>
+
+<details class="card rules-panel" {{ 'open' if error }}>
+  <summary><strong>Detection rules</strong></summary>
+  <form method="post" action="/events/{{ analysis.id }}/thresholds">
+    <div class="table-wrap">
+      <table class="table rules">
+        <thead><tr><th>Rule</th><th>Counts</th><th>Limit (events)</th><th>Window (seconds)</th></tr></thead>
+        <tbody>
+        {% for rule, cfg in defaults.items() %}
+          {% set current = analysis.thresholds.get(rule, cfg) %}
+          <tr>
+            <td><strong>{{ rule_titles[rule] }}</strong><br><span class="muted small">built-in: {{ cfg.threshold }} in {{ cfg.window_seconds|duration }}{% if saved[rule] != cfg %} · your default: {{ saved[rule].threshold }} in {{ saved[rule].window_seconds|duration }}{% endif %}</span></td>
+            <td class="muted small">{{ RULE_GUIDE[rule].matches|capitalize }}</td>
+            <td><input type="number" min="1" max="86400" name="{{ rule }}.threshold" value="{{ current.threshold }}" required aria-label="{{ rule_titles[rule] }} limit"></td>
+            <td><input type="number" min="1" max="86400" name="{{ rule }}.window_seconds" value="{{ current.window_seconds }}" required aria-label="{{ rule_titles[rule] }} time window"></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <label class="checkbox"><input type="checkbox" name="remember" value="1"> Use these limits for future analyses</label>
+    <div class="actions">
+      <button class="btn btn-primary" type="submit">Run detection again</button>
+      <button class="btn" type="submit" name="action" value="reset" formnovalidate>Reset to built-in defaults</button>
+    </div>
+  </form>
+</details>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,87 @@
+{# Inline SVG icons (stroke style) so the app works fully offline. #}
+{% macro icon(name) -%}
+<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+{%- if name == "overview" -%}<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>
+{%- elif name == "analysis" -%}<path d="M3 12h4l3-8 4 16 3-8h4"/>
+{%- elif name == "upload" -%}<path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/>
+{%- elif name == "generate" -%}<path d="M14.5 4h-5L8 7H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><path d="M12 10v6M9 13h6"/>
+{%- elif name == "folder" -%}<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+{%- elif name == "explorer" -%}<path d="M4 6h16M4 12h16M4 18h10"/>
+{%- elif name == "search" -%}<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>
+{%- elif name == "events" -%}<path d="M12 3 4 6v6c0 5 3.4 8.3 8 9 4.6-.7 8-4 8-9V6z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
+{%- elif name == "reports" -%}<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 17h5"/>
+{%- elif name == "history" -%}<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>
+{%- elif name == "download" -%}<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>
+{%- elif name == "trash" -%}<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>
+{%- elif name == "arrow" -%}<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>
+{%- elif name == "check" -%}<path d="m5 12 5 5 9-10"/>
+{%- elif name == "play" -%}<path d="m7 4 13 8-13 8z"/>
+{%- elif name == "pause" -%}<path d="M8 4v16M16 4v16"/>
+{%- elif name == "stop" -%}<rect x="5" y="5" width="14" height="14" rx="2"/>
+{%- elif name == "refresh" -%}<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/>
+{%- elif name == "logo" -%}<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M7.5 11h2l1-2.5 1.5 5 1-2.5h1.5"/>
+{%- endif -%}
+</svg>
+{%- endmacro %}
+
+{# Shown on analysis pages when there is no data yet. #}
+{% macro empty_state(title, text) -%}
+<div class="empty">
+  <h2>{{ title }}</h2>
+  <p>{{ text }}</p>
+  <div class="empty-actions">
+    <a class="btn btn-primary" href="/monitor">{{ icon("folder") }} Monitor a folder</a>
+    <a class="btn" href="/upload">{{ icon("upload") }} Upload a file</a>
+  </div>
+</div>
+{%- endmacro %}
+
+{# Which data the page shows, with a switcher. #}
+{% macro analysis_bar(analysis, analyses, path) -%}
+<div class="analysis-bar">
+  <div class="analysis-bar-info">
+    <strong>{{ analysis.name }}</strong>
+    <span class="muted">
+      {{ analysis.source|source_label }} ·
+      {% if analysis.source == "monitor" and analysis.summary.updated_at %}updated {{ analysis.summary.updated_at|localtime("%d %b %Y, %H:%M:%S") }}{% else %}analyzed {{ analysis.created_at|localtime("%d %b %Y, %H:%M") }}{% endif %} ·
+      {{ analysis.total_entries|number }} records
+      {%- if analysis.source in ("upload", "monitor") and analysis.summary.source_timezone %} · times read as {{ analysis.summary.source_timezone|replace("_", " ") }}{% endif %}
+    </span>
+  </div>
+  {% if analyses|length > 1 %}
+  <form class="analysis-switch" method="get" action="{{ path }}">
+    <label for="analysis-select">Analysis</label>
+    <select id="analysis-select" name="analysis_id" onchange="this.form.submit()">
+      {% for item in analyses %}
+      <option value="{{ item.id }}" {{ 'selected' if item.id == analysis.id }}>#{{ item.id }} · {{ item.name|truncate(40, True) }}</option>
+      {% endfor %}
+    </select>
+    <noscript><button class="btn btn-sm">Open</button></noscript>
+  </form>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{# Tabs of the Log Analysis section. #}
+{% macro analysis_tabs(current) -%}
+<nav class="tabs" aria-label="Log analysis">
+  <a href="/monitor" class="{{ 'active' if current == 'monitor' }}">{{ icon("folder") }} Folder monitoring</a>
+  <a href="/upload" class="{{ 'active' if current == 'upload' }}">{{ icon("upload") }} Upload file</a>
+  <a href="/generate" class="{{ 'active' if current == 'generate' }}">{{ icon("generate") }} Sample data</a>
+</nav>
+{%- endmacro %}
+
+{% macro state_badge(state) -%}
+<span class="state state-{{ state }}"><span class="state-dot"></span>{{ {"running": "Monitoring", "paused": "Paused", "stopped": "Off"}[state] }}</span>
+{%- endmacro %}
+
+{% macro level_badge(level) -%}<span class="badge level-{{ level|lower }}">{{ level }}</span>{%- endmacro %}
+
+{% macro status_badge(code) -%}
+{%- if code -%}<span class="status s{{ (code // 100) }}xx">{{ code }}</span>{%- else -%}<span class="muted">-</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro severity_badge(severity) -%}<span class="badge sev-{{ severity }}">{{ severity|capitalize }}</span>{%- endmacro %}
+
+{# Keeps the selected analysis when moving between pages. #}
+{% macro aq(analysis) -%}{% if analysis %}?analysis_id={{ analysis.id }}{% endif %}{%- endmacro %}

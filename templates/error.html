@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Error {{ code }}{% endblock %}
+{% block heading %}{{ "Page not found" if code == 404 else "Something went wrong" }}{% endblock %}
+{% block description %}Error {{ code }}{% endblock %}
+{% block content %}
+<div class="empty">
+  <h2>{{ detail if detail else "The request could not be completed." }}</h2>
+  <p>The analysis may have been deleted, or the link is incorrect.</p>
+  <div class="empty-actions"><a class="btn btn-primary" href="/">Go to Dashboard</a><a class="btn" href="/history">Open History</a></div>
+</div>
+{% endblock %}

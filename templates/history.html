@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon, empty_state %}
+{% block title %}History{% endblock %}
+{% block heading %}History{% endblock %}
+
+
+{% block content %}
+{% if not analyses %}
+  {{ empty_state("No saved analyses yet", "Uploaded, monitored and sample analyses are listed here.") }}
+{% else %}
+<section class="card">
+  <div class="card-head">
+    <h2>{{ analyses|length }} saved analys{{ "is" if analyses|length == 1 else "es" }}</h2>
+    <span class="muted small">Newest first · times in {{ TIMEZONE_NAME|replace("_", " ") }} time</span>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Data</th><th>Analyzed at</th><th class="num">Log records</th><th class="num">Errors</th><th class="num">Suspicious</th><th class="num">Actions</th></tr></thead>
+      <tbody>
+      {% for a in analyses %}
+        <tr>
+          <td>
+            <a class="link" href="/?analysis_id={{ a.id }}"><strong>{{ a.name }}</strong></a><br>
+            <span class="muted small">#{{ a.id }} · {{ a.source|source_label }}{% if a.invalid_lines %} · {{ a.invalid_lines|number }} unreadable lines{% endif %}</span>
+          </td>
+          <td class="mono nowrap">{{ a.created_at|localtime("%Y-%m-%d %H:%M") }}</td>
+          <td class="num">{{ a.total_entries|number }}</td>
+          <td class="num">{{ a.error_rate }}%</td>
+          <td class="num">{% if a.detection_count %}<a class="pill" href="/events?analysis_id={{ a.id }}" title="Open findings">{{ a.detection_count }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+          <td>
+            <div class="row-actions">
+              <a class="btn btn-sm" href="/?analysis_id={{ a.id }}">Open</a>
+              <a class="btn btn-sm" href="/reports/{{ a.id }}/download?format=txt">{{ icon("download") }} Report</a>
+              <form method="post" action="/history/{{ a.id }}/delete" onsubmit="return confirm('Delete analysis #{{ a.id }} and all of its records? This cannot be undone.');">
+                <button class="btn btn-sm btn-danger" type="submit" aria-label="Delete analysis #{{ a.id }}">{{ icon("trash") }} Delete</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

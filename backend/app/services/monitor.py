@@ -27,20 +27,22 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, distinct, select
 from sqlalchemy.orm import Session
 
 from project import parse_log_text
 
-from ..database import SessionLocal
-from ..models import Analysis, Setting, WatchedFile
+from ..database import SessionLocal, engine
+from ..models import Analysis, LogEntry, Setting, WatchedFile
 from ..timeutils import format_local, utc_now
 from . import analysis_service as svc
 from .textcodec import UTF8, complete_lines_end, decode, detect_encoding, is_binary
@@ -55,11 +57,17 @@ REFRESH_DURING_BACKLOG = 30.0        # seconds between statistics refreshes whil
 STATS_INTERVAL = 10.0                # seconds between statistics refreshes of a growing file
 HEAD_BYTES = 1024                    # fingerprint: start of the file
 TAIL_BYTES = 256                     # fingerprint: bytes just before the read position
+MAX_DRAIN_BYTES = 64 * 1024 * 1024   # max. bytes read from a renamed (rotated) file
+RETENTION_CHOICES = (7, 30, 90, 365, 0)   # days of monitored records to keep; 0 = forever
+RETENTION_INTERVAL = 3600.0          # seconds between automatic clean-ups
+COMPACT_AFTER_ROWS = 10_000          # compact the database file after deleting this many records
+HEARTBEAT_KEY = "monitor_heartbeat"
 
 # Only one scan at a time (background thread vs. "Scan now" button).
 _SCAN_LOCK = threading.Lock()
 _runtime_lock = threading.Lock()
-_runtime: dict[str, Any] = {"last_scan_at": None, "last_error": None, "last_new_records": 0}
+_runtime: dict[str, Any] = {"last_scan_at": None, "last_error": None, "last_new_records": 0,
+                            "offline_gap": None, "last_cleanup": None}
 _last_refresh: dict[int, float] = {}
 _dirty: set[int] = set()             # analyses whose statistics wait for a refresh
 
@@ -75,6 +83,7 @@ class MonitorConfig:
     timezone: str = "UTC"             # zone of timestamps without an offset
     include_existing: bool = True     # also read what the files already contain
     started_at: str | None = None
+    retention_days: int = 30          # monitored records older than this are deleted (0 = keep)
 
 
 @dataclass
@@ -141,7 +150,8 @@ def start_monitoring(db: Session, directory: str, timezone: str, include_existin
         previous = get_config(db)
         if previous.directory != str(path) or previous.state == "stopped":
             db.execute(delete(WatchedFile))  # new permission: start tracking from scratch
-        config = MonitorConfig("running", str(path), timezone, include_existing, utc_now().isoformat())
+        config = MonitorConfig("running", str(path), timezone, include_existing, utc_now().isoformat(),
+                               previous.retention_days)
         _save_config(db, config)
         _register_existing_files(db, path, include_existing)
         db.commit()
@@ -278,13 +288,96 @@ def scan_once(db: Session) -> ScanResult:
             _process_file(db, watched, stat, timezone, config, result)
 
         for watched in tracked.values():
+            # Renamed away (e.g. app.log -> app.log.1) before a new file appeared:
+            # read what was appended to it since the last scan.
+            if watched.offset:
+                try:
+                    note = _drain_renamed(db, watched, timezone, config, result)
+                except OSError:
+                    note = ""
+                if note:
+                    watched.message = note
             if watched.status != "missing":
                 watched.status = "missing"
-                watched.message = "File not found (deleted, moved or rotated away)."
+                watched.message = watched.message if "rotated file" in watched.message else \
+                    "File not found (deleted, moved or rotated away)."
 
         _refresh_touched(db, result)
         db.commit()
         return result
+
+
+def _find_renamed(directory: Path, file_id: str, current: str) -> Path | None:
+    """The file that still has the old identity, e.g. ``app.log`` renamed to ``app.log.1``.
+
+    Rotated names often have other extensions, so every regular file in the
+    folder is checked (this only happens when a rotation was detected).
+    """
+    if not file_id:
+        return None
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.path == current:
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False) and \
+                            _identity(os.stat(entry.path, follow_symlinks=False)) == file_id:
+                        return Path(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return None
+    return None
+
+
+def _drain_renamed(db: Session, watched: WatchedFile, timezone: ZoneInfo, config: MonitorConfig,
+                   result: ScanResult) -> str:
+    """Read lines written to a log after the last scan but before it was renamed away."""
+    old = _find_renamed(Path(watched.path).parent, watched.file_id, watched.path)
+    if old is None:
+        return ""
+    stat = os.stat(old)
+    if not _same_content(old, watched, stat) or stat.st_size <= watched.offset:
+        return ""
+    remaining = stat.st_size - watched.offset
+    data = _read_chunk(old, watched.offset, min(remaining, MAX_DRAIN_BYTES))
+    _consume(db, watched, data, watched.encoding or UTF8, timezone, config, result, old)
+    note = f"Read the last {len(data):,} bytes of the rotated file {old.name}."
+    if remaining > MAX_DRAIN_BYTES:
+        note += f" {remaining - MAX_DRAIN_BYTES:,} further bytes were skipped."
+    return note
+
+
+def _consume(db: Session, watched: WatchedFile, chunk: bytes, encoding: str, timezone: ZoneInfo,
+             config: MonitorConfig, result: ScanResult, source: Path) -> int:
+    """Parse and store ``chunk`` (bytes from ``watched.offset`` of ``source``). Returns unreadable lines."""
+    at_start = watched.offset == 0
+    if is_binary(chunk, encoding):
+        watched.offset += len(chunk)
+        _remember_fingerprint(source, watched)
+        watched.status, watched.message = "error", "Binary (non-text) content was skipped."
+        return 0
+
+    text = decode(chunk, encoding, at_file_start=at_start)
+    context = dict(watched.parser_state or {})
+    entries, invalid = parse_log_text(text, timezone, context)
+    watched.parser_state = context or None
+    for entry in entries:
+        entry["line_number"] += watched.line_count
+    watched.line_count += text.count("\n") + (0 if text.endswith("\n") else 1)
+    watched.offset += len(chunk)
+    _remember_fingerprint(source, watched)
+
+    if entries or invalid:
+        analysis = _analysis_for(db, watched, config)
+        svc.append_entries(db, analysis, entries, invalid)
+        result.new_entries.setdefault(analysis.id, []).extend(entries)
+        result.new_records += len(entries)
+        result.invalid_lines += invalid
+        if entries:
+            watched.last_data_at = utc_now()
+    return invalid
 
 
 def _process_file(db: Session, watched: WatchedFile, stat: os.stat_result, timezone: ZoneInfo,
@@ -293,15 +386,17 @@ def _process_file(db: Session, watched: WatchedFile, stat: os.stat_result, timez
     note = ""
     try:
         if watched.offset > 0 and not _same_content(path, watched, stat):
-            # Rotated, truncated or replaced by different content: start over.
+            # Rotated, truncated or replaced by different content. If the old file
+            # was renamed (rename-style rotation), first read what it still had.
+            drained = _drain_renamed(db, watched, timezone, config, result)
             watched.offset = watched.line_count = 0
             watched.encoding, watched.parser_state, watched.head_hash = "", None, ""
-            note = "File was rotated or replaced with new content; reading it from the start."
+            note = " ".join(filter(None, [drained, "File was rotated or replaced; reading the new file from the start."]))
         stable = watched.size == stat.st_size and watched.mtime == stat.st_mtime
         watched.file_id, watched.size, watched.mtime = _identity(stat), stat.st_size, stat.st_mtime
 
         if stat.st_size <= watched.offset:
-            if watched.status in ("waiting", "missing"):
+            if watched.status in ("waiting", "missing") or note:
                 watched.status, watched.message = "ok", note
             if watched.offset and not watched.head_hash:
                 _remember_fingerprint(path, watched)   # upgrade rows from older versions
@@ -321,29 +416,21 @@ def _process_file(db: Session, watched: WatchedFile, stat: os.stat_result, timez
             chunk = b""                           # a line is still being written
         result.backlog = result.backlog or more
         if not chunk:
+            if note:
+                watched.status, watched.message = "ok", note
             return
-
-        at_start = watched.offset == 0
-        if is_binary(chunk, encoding):
-            watched.offset += len(chunk)
-            _remember_fingerprint(path, watched)
-            watched.status, watched.message = "error", "Binary (non-text) content was skipped."
+        invalid = _consume(db, watched, chunk, encoding, timezone, config, result, path)
+        if watched.status == "error" and watched.message.startswith("Binary"):
             return
-
-        text = decode(chunk, encoding, at_file_start=at_start)
-        context = dict(watched.parser_state or {})
-        entries, invalid = parse_log_text(text, timezone, context)
-        watched.parser_state = context or None
-        for entry in entries:
-            entry["line_number"] += watched.line_count
-        watched.line_count += text.count("\n") + (0 if text.endswith("\n") else 1)
-        watched.offset += len(chunk)
-        _remember_fingerprint(path, watched)
     except FileNotFoundError:
         watched.status, watched.message = "missing", "File disappeared while it was being read."
         return
-    except PermissionError:
-        watched.status, watched.message = "error", "Permission denied; LogScope cannot read this file."
+    except PermissionError as error:
+        watched.status = "error"
+        # Windows reports files opened exclusively by another program (error 32) as PermissionError.
+        watched.message = ("File is in use by another program; LogScope will retry."
+                           if getattr(error, "winerror", None) == 32
+                           else "Permission denied; LogScope cannot read this file.")
         return
     except OSError as error:
         watched.status, watched.message = "error", f"Read error: {error.strerror or error}"[:300]
@@ -351,14 +438,6 @@ def _process_file(db: Session, watched: WatchedFile, stat: os.stat_result, timez
 
     watched.status = "ok"
     watched.message = note or (f"{invalid} unreadable line(s) skipped in the last update." if invalid else "")
-    if entries or invalid:
-        analysis = _analysis_for(db, watched, config)
-        svc.append_entries(db, analysis, entries, invalid)
-        result.new_entries.setdefault(analysis.id, []).extend(entries)
-        result.new_records += len(entries)
-        result.invalid_lines += invalid
-        if entries:
-            watched.last_data_at = utc_now()
 
 
 def _analysis_for(db: Session, watched: WatchedFile, config: MonitorConfig) -> Analysis:
@@ -397,6 +476,162 @@ def _refresh_touched(db: Session, result: ScanResult) -> None:
         _dirty.discard(analysis_id)
 
 
+# --------------------------------------------------------------------------- retention and database size
+
+def save_retention(db: Session, days: int) -> None:
+    if days not in RETENTION_CHOICES:
+        raise MonitorError("Choose a retention period from the list.")
+    config = get_config(db)
+    config.retention_days = days
+    _save_config(db, config)
+
+
+def apply_retention(db: Session) -> int:
+    """Delete monitored records older than the retention period; returns the number deleted.
+
+    Only analyses created by folder monitoring are cleaned up (uploads and
+    sample data are kept as they are). Age is measured by the event time in
+    the log. Statistics, findings and counters of affected files are rebuilt.
+    """
+    with _SCAN_LOCK:
+        days = get_config(db).retention_days
+        if not days:
+            return 0
+        cutoff = utc_now() - timedelta(days=days)
+        monitored = select(Analysis.id).where(Analysis.source == "monitor")
+        old = (LogEntry.analysis_id.in_(monitored), LogEntry.timestamp < cutoff)
+        affected = list(db.scalars(select(distinct(LogEntry.analysis_id)).where(*old)))
+        if not affected:
+            return 0
+        deleted = db.execute(LogEntry.__table__.delete().where(*old)).rowcount or 0
+        for analysis_id in affected:
+            analysis = db.get(Analysis, analysis_id)
+            if analysis is not None:
+                svc.refresh_analysis(db, analysis)
+        db.commit()
+    _set_runtime(last_cleanup={"at": utc_now(), "deleted": deleted})
+    log.info("Retention: deleted %s records older than %s days", deleted, days)
+    return deleted
+
+
+def database_file() -> Path | None:
+    name = engine.url.database
+    return Path(name) if engine.url.get_backend_name() == "sqlite" and name and name != ":memory:" else None
+
+
+def database_size() -> int:
+    """Size of the database including its write-ahead log, in bytes."""
+    path = database_file()
+    if path is None:
+        return 0
+    return sum(p.stat().st_size for p in (path, Path(f"{path}-wal")) if p.exists())
+
+
+def compact_database() -> None:
+    """Give space freed by deleted records back to the operating system."""
+    if database_file() is None:
+        return
+    with _SCAN_LOCK, engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.exec_driver_sql("VACUUM")
+        connection.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+def run_cleanup(db: Session | None = None) -> int:
+    """Retention plus compaction when much was deleted. Never raises."""
+    own_session = db is None
+    db = db or SessionLocal()
+    try:
+        deleted = apply_retention(db)
+        if deleted >= COMPACT_AFTER_ROWS:
+            compact_database()
+        return deleted
+    except Exception:
+        log.exception("Retention clean-up failed")
+        db.rollback()
+        return 0
+    finally:
+        if own_session:
+            db.close()
+
+
+# --------------------------------------------------------------------------- single instance
+
+_lock_handle = None
+
+
+def _lock_file() -> Path:
+    database = database_file()
+    return Path(f"{database}.lock") if database else Path.home() / ".logscope.lock"
+
+
+def acquire_instance_lock() -> bool:
+    """Only one LogScope process may monitor a database; otherwise lines would be stored twice."""
+    global _lock_handle
+    if _lock_handle is not None:
+        return True
+    path = _lock_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    _lock_handle = handle
+    return True
+
+
+def release_instance_lock() -> None:
+    global _lock_handle
+    if _lock_handle is None:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            _lock_handle.seek(0)
+            msvcrt.locking(_lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(_lock_handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    _lock_handle.close()
+    _lock_handle = None
+
+
+# --------------------------------------------------------------------------- offline detection
+
+def _write_heartbeat(db: Session) -> None:
+    setting = db.get(Setting, HEARTBEAT_KEY)
+    value = {"at": utc_now().isoformat()}
+    if setting:
+        setting.value = value
+    else:
+        db.add(Setting(key=HEARTBEAT_KEY, value=value))
+    db.commit()
+
+
+def note_offline_gap(db: Session) -> None:
+    """Remember how long monitoring was not running (LogScope closed or computer off)."""
+    setting = db.get(Setting, HEARTBEAT_KEY)
+    if not setting or get_config(db).state != "running":
+        return
+    last = datetime.fromisoformat(setting.value["at"])
+    gap = utc_now() - last
+    if gap > timedelta(seconds=max(60, 3 * SCAN_INTERVAL)):
+        _set_runtime(offline_gap={"since": last, "until": utc_now()})
+
+
 # --------------------------------------------------------------------------- status
 
 def _set_runtime(**values: Any) -> None:
@@ -406,12 +641,17 @@ def _set_runtime(**values: Any) -> None:
 
 def run_scan(db: Session | None = None) -> ScanResult | None:
     """Scan once and record the outcome for the status display. Never raises."""
+    if not acquire_instance_lock():
+        _set_runtime(last_error="Another LogScope window or process is already monitoring. "
+                                "Close it, or use that instance.")
+        return None
     own_session = db is None
     db = db or SessionLocal()
     try:
         result = scan_once(db)
         if result.state == "running":
             _set_runtime(last_scan_at=utc_now(), last_error=result.error, last_new_records=result.new_records)
+            _write_heartbeat(db)
         return result
     except Exception as error:  # keep the monitor alive whatever happens
         log.exception("Monitoring scan failed")
@@ -476,6 +716,20 @@ def monitor_status(db: Session) -> dict[str, Any]:
         "total_warnings": sum(f["warnings"] for f in files),
         "total_findings": sum(f["findings"] for f in files),
         "synced_folder": in_synced_folder(config.directory),
+        "retention_days": config.retention_days,
+        "retention_choices": RETENTION_CHOICES,
+        "database_size": database_size(),
+        "database_path": str(database_file() or ""),
+        "offline_gap": (
+            f"Monitoring was not running from {format_local(runtime['offline_gap']['since'], '%Y-%m-%d %H:%M')} "
+            f"to {format_local(runtime['offline_gap']['until'], '%Y-%m-%d %H:%M')}. Lines written in that time "
+            "were read when LogScope started again."
+            if runtime.get("offline_gap") and config.state == "running" else ""
+        ),
+        "last_cleanup": (
+            f"{runtime['last_cleanup']['deleted']:,} old records removed at "
+            f"{format_local(runtime['last_cleanup']['at'], '%Y-%m-%d %H:%M')}" if runtime.get("last_cleanup") else ""
+        ),
     }
 
 
@@ -500,6 +754,13 @@ class MonitorWorker:
     def start(self) -> None:
         if self.alive:
             return
+        db = SessionLocal()
+        try:
+            note_offline_gap(db)
+        except Exception:
+            log.exception("Could not read the monitoring heartbeat")
+        finally:
+            db.close()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="logscope-monitor", daemon=True)
         self._thread.start()
@@ -509,13 +770,18 @@ class MonitorWorker:
         self._wake.set()
         if self._thread:
             self._thread.join(timeout)
+        release_instance_lock()
 
     def wake(self) -> None:
         """Scan as soon as possible (e.g. right after monitoring was started)."""
         self._wake.set()
 
     def _run(self) -> None:
+        next_cleanup = time.monotonic() + 30  # first clean-up shortly after start
         while not self._stop.is_set():
+            if time.monotonic() >= next_cleanup:
+                run_cleanup()
+                next_cleanup = time.monotonic() + RETENTION_INTERVAL
             result = run_scan()
             # Catch up quickly on large files, otherwise wait for the next interval.
             delay = 0.2 if result is not None and result.backlog else SCAN_INTERVAL

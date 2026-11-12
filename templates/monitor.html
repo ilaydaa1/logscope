@@ -38,6 +38,7 @@
     <div><dt>Interval</dt><dd>{{ st.interval|int }} s</dd></div>
   </dl>
   <p class="status-error" data-field="last_error" {{ 'hidden' if not st.last_error }}>{{ st.last_error or "" }}</p>
+  {% if st.offline_gap %}<p class="status-warning">{{ st.offline_gap }}</p>{% endif %}
   {% if st.synced_folder %}
   <p class="status-warning">This folder is synced by OneDrive. Online-only files are downloaded when read, and sync can rewrite files. LogScope detects rewrites and does not read lines twice, but a local folder outside OneDrive is more reliable.</p>
   {% endif %}
@@ -97,6 +98,51 @@
   </form>
 </section>
 {% endif %}
+
+<section class="card">
+  <h2 class="card-title">Settings</h2>
+  <div class="settings-grid">
+    <form method="post" action="/monitor/settings" class="setting">
+      <label for="retention_days"><strong>Keep monitored records</strong></label>
+      <div class="setting-row">
+        <select id="retention_days" name="retention_days">
+          {% for days in st.retention_choices %}
+          <option value="{{ days }}" {{ 'selected' if st.retention_days == days }}>{{ "Forever" if days == 0 else ("1 year" if days == 365 else days ~ " days") }}</option>
+          {% endfor %}
+        </select>
+        <button class="btn" type="submit">Save</button>
+      </div>
+      <span class="hint">Records of monitored files older than this (by log time) are deleted every hour. Uploaded files and sample data are never deleted automatically.{% if st.last_cleanup %} Last clean-up: {{ st.last_cleanup }}.{% endif %}</span>
+    </form>
+
+    <form method="post" action="/monitor/compact" class="setting">
+      <label><strong>Database</strong></label>
+      <div class="setting-row">
+        <span class="mono">{{ st.database_size|filesize }}</span>
+        <button class="btn" type="submit">Compact now</button>
+      </div>
+      <span class="hint" title="{{ st.database_path }}">Stored outside synced folders. Compacting returns space from deleted records to the disk.</span>
+    </form>
+
+    <form method="post" action="/monitor/autostart" class="setting">
+      <label><strong>Start at sign-in</strong></label>
+      {% if autostart_supported %}
+      <div class="setting-row">
+        <span class="file-status {{ 'fs-ok' if autostart_enabled else 'fs-waiting' }}">{{ "On" if autostart_enabled else "Off" }}</span>
+        {% if autostart_enabled %}
+        <button class="btn" type="submit">Turn off</button>
+        {% else %}
+        <input type="hidden" name="enable" value="1">
+        <button class="btn" type="submit">Turn on</button>
+        {% endif %}
+      </div>
+      <span class="hint">Starts LogScope in the background when you sign in to Windows, so monitoring continues without opening a terminal. Adds one file (LogScope.vbs) to your Startup folder.</span>
+      {% else %}
+      <span class="hint">Available on Windows. On macOS or Linux, start <code>python project.py</code> with a login item or a systemd user service.</span>
+      {% endif %}
+    </form>
+  </div>
+</section>
 {% endblock %}
 
 {% block scripts %}<script src="/static/js/monitor.js?v={{ ASSET_VERSION }}"></script>{% endblock %}

@@ -104,6 +104,21 @@ def add_missing_columns(bind) -> list[str]:
     return added
 
 
+def add_missing_indexes(bind) -> list[str]:
+    """Create indexes defined in the models that an older database does not have yet."""
+    added = []
+    inspector = inspect(bind)
+    for table in Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            continue
+        existing = {index["name"] for index in inspector.get_indexes(table.name)}
+        for index in table.indexes:
+            if index.name not in existing:
+                index.create(bind)
+                added.append(index.name)
+    return added
+
+
 def init_db() -> None:
     """Create the data folder and tables, migrating older databases if needed."""
     from . import models  # noqa: F401  (registers the models on Base.metadata)
@@ -113,6 +128,7 @@ def init_db() -> None:
         copy_legacy_database(LEGACY_DB_PATH, DEFAULT_DB_PATH)
     Base.metadata.create_all(bind=engine)
     add_missing_columns(engine)
+    add_missing_indexes(engine)
 
 
 def get_db() -> Iterator[Session]:

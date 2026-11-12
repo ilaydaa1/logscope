@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..services import analysis_service as svc
-from ..services import monitor
+from ..services import autostart, monitor
 from ..templating import render
 from .ingest import SOURCE_TIMEZONES
 
@@ -21,6 +21,7 @@ def _monitor_view(request: Request, db: Session, error: str | None = None, statu
     return render(
         request, db, "monitor.html", active="analysis", tab="monitor", analysis=svc.get_analysis(db, None),
         status=status, source_timezones=SOURCE_TIMEZONES, error=error, status_code=status_code,
+        autostart_supported=autostart.supported(), autostart_enabled=autostart.enabled(),
         form=form or {"directory": status["directory"], "timezone": status["timezone"],
                       "include_existing": status["include_existing"]},
     )
@@ -79,6 +80,36 @@ def scan_now(db: Session = Depends(get_db)):
     """Run a scan immediately in this request (shares the lock with the background thread)."""
     monitor.run_scan(db)
     return RedirectResponse("/monitor?notice=scanned", status_code=303)
+
+
+@router.post("/monitor/settings")
+def save_settings(request: Request, retention_days: str = Form("30"), db: Session = Depends(get_db)):
+    """Save the retention period and clean up right away."""
+    try:
+        monitor.save_retention(db, int(retention_days))
+    except (ValueError, monitor.MonitorError):
+        return _monitor_view(request, db, error="Choose a retention period from the list.", status_code=400)
+    monitor.run_cleanup(db)
+    return RedirectResponse("/monitor?notice=settings_saved", status_code=303)
+
+
+@router.post("/monitor/compact")
+def compact(db: Session = Depends(get_db)):
+    monitor.compact_database()
+    return RedirectResponse("/monitor?notice=compacted", status_code=303)
+
+
+@router.post("/monitor/autostart")
+def set_autostart(request: Request, enable: str = Form(""), db: Session = Depends(get_db)):
+    """Start LogScope at Windows sign-in (writes or removes one script in the Startup folder)."""
+    try:
+        if enable:
+            autostart.enable()
+        else:
+            autostart.disable()
+    except OSError as error:
+        return _monitor_view(request, db, error=f"Could not change the sign-in setting: {error}", status_code=400)
+    return RedirectResponse(f"/monitor?notice={'autostart_on' if enable else 'autostart_off'}", status_code=303)
 
 
 @router.get("/api/monitor/status")

@@ -109,7 +109,19 @@ When monitoring is **on**:
 | Files · Records · Last scan · Last new data · Interval | Overall status. The folder is checked every 5 seconds. |
 | **File table** | For each file: name (click to open its Dashboard), status, size, how much has been read, records, findings, time of last new data, and a note (e.g. "File was rotated…"). Updates automatically. |
 
-File statuses: **Waiting** (not read yet), **Ok**, **Missing** (deleted or moved), **Error** (e.g. permission denied, binary content).
+File statuses: **Waiting** (not read yet), **Ok**, **Missing** (deleted or moved), **Error** (e.g. permission denied, file in use by another program, binary content).
+
+**Settings** (below the file table, always available):
+
+| Setting | Meaning |
+|---|---|
+| **Keep monitored records** | 7 days, 30 days (default), 90 days, 1 year or Forever. Records of monitored files whose log time is older are deleted every hour, and statistics and findings are recalculated. Uploaded files and sample data are never deleted automatically. **Save** applies it immediately. |
+| **Database** | Current size of LogScope's database. **Compact now** gives the space of deleted records back to the disk (also done automatically after large clean-ups). |
+| **Start at sign-in** (Windows) | **Turn on** makes LogScope start in the background whenever you sign in to Windows, so monitoring continues without opening a terminal. It adds one file, `LogScope.vbs`, to your Startup folder; **Turn off** removes it. |
+
+If LogScope was closed for a while (or the computer was off), the status shows *Monitoring was not running from … to …*. Lines written during that time are read when it starts again.
+
+Only one LogScope can monitor at a time. If a second copy is started (for example once by sign-in and once by hand), it shows a message instead of reading the files a second time.
 
 If the folder is inside OneDrive, a warning is shown: OneDrive may download online-only files when they are read and may rewrite files while syncing. LogScope handles rewrites without reading lines twice, but a local folder (e.g. `C:\Logs`) is more reliable.
 
@@ -165,6 +177,7 @@ All analyses, newest first: name (click to open), number, source, unreadable lin
 5. Tick the permission box and click **Start monitoring**.
 6. Within seconds the file table fills in. Every file becomes its own analysis — click a file name to open its Dashboard.
 7. Leave LogScope running. New lines are read every 5 seconds; the Dashboard status and file table update by themselves. Monitoring also resumes automatically after LogScope is restarted.
+8. Optional: in **Settings**, turn on **Start at sign-in** so you never have to start it by hand, and choose how long records are kept.
 
 **Example:** your application writes `C:\logs\shop\app.log`. Monitor `C:\logs\shop`. When the application logs `2026-11-11 21:50:00 ERROR Payment service timeout after 30 s` several times, the **Errors** count rises and "Payment service timeout after # s" appears under **Recurring issues**.
 
@@ -197,7 +210,7 @@ Click the point in the **Activity** chart, or enter **From / To** on the Logs pa
 
 ### 5.7 Pause or stop monitoring
 
-**Log Analysis → Pause** (keeps the reading position) / **Resume**. **Stop** withdraws folder access; analyses stay in History.
+**Log Analysis → Pause** (keeps the reading position) / **Resume**. **Stop** withdraws folder access; analyses stay in History. Turning off **Start at sign-in** keeps LogScope from starting automatically next time.
 
 ---
 
@@ -280,7 +293,7 @@ Accepted details: ISO-style times with optional fractions and zone (`Z`, `+03:00
 - Each file's read position is remembered; only new bytes are read, so lines are never analyzed twice (also across restarts).
 - An unfinished last line is held until it is complete (or the file has not changed for one scan).
 - **No duplicates:** LogScope remembers a fingerprint of each file's beginning and of the part it has read. If a program saves the file again with the same old lines plus new ones (some editors and OneDrive do this), only the new lines are read.
-- **Rotation:** if the old content is gone (the file was rotated, truncated or replaced with different content), the file is read again from the beginning. Rotated-away files with other extensions (e.g. `app.log.1`) are ignored.
+- **Rotation:** if a log is rotated by renaming (`app.log` → `app.log.1`, then a new `app.log`), LogScope first reads the lines that were still added to the old file, then reads the new file from the beginning. If the old content is simply gone (truncated or replaced), the new content is read from the beginning. Rotated files themselves (e.g. `app.log.1`) are not monitored as separate files.
 - Missing files, permission problems and a missing folder are shown in the file table / status instead of stopping monitoring.
 
 ### 7.4 Outputs
@@ -292,7 +305,7 @@ Dashboard and pages; TXT and CSV reports; sample `.log` files. All data is store
 ## 8. Limitations
 
 - **One folder** at a time, not including sub-folders; only `.log`/`.txt` names (compressed or numbered rotated files such as `.gz` or `.log.1` are not read).
-- **Polling every 5 seconds**, not instant. LogScope must be running to monitor; lines written while it is off are read when it starts again (unless the file was replaced and its old content rotated away).
+- **Polling every 5 seconds**, not instant. LogScope must be running to monitor (use *Start at sign-in*); lines written while it is off are read when it starts again. If a file was rotated *several* times while LogScope was off, only the last rotated file and the new file are read.
 - **Statistics delay:** for monitored files, totals and charts are updated at most every 10 seconds (30 s while catching up on a big file); findings are updated with every scan.
 - A last line without a newline that is extended later (after being read) is split into two records.
 - **Formats:** JSON logs, syslog, Windows Event Log files (`.evtx`) and multi-line entries (stack traces) are not supported.

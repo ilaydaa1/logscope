@@ -9,18 +9,20 @@ not grow with the size of the log.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Integer, case, cast, delete, distinct, func, insert, or_, select, update
+from sqlalchemy import Integer, case, cast, delete, distinct, func, insert, or_, select, tuple_, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from project import (
     DEFAULT_THRESHOLDS,
     LOG_LEVELS,
+    SEVERITY_ORDER,
     analyze_log_entries,
     choose_bucket_size,
     classify_entry,
@@ -33,7 +35,7 @@ from project import (
     recurring_key,
 )
 
-from ..models import Analysis, Detection, LogEntry, Setting
+from ..models import Analysis, Detection, LogEntry, RuleCount, Setting
 from ..timeutils import utc_now
 
 ENTRY_FIELDS = ("line_number", "timestamp", "level", "ip", "method", "endpoint", "status", "message")
@@ -126,7 +128,7 @@ def create_empty_analysis(db: Session, *, name: str, source: str, filename: str 
     summary.update(extra_summary or {})
     analysis = Analysis(name=name[:200], source=source, filename=filename, summary=summary,
                         thresholds=saved_thresholds(db), total_entries=0, invalid_lines=0,
-                        detection_count=0, error_rate=0.0)
+                        detection_count=0, error_rate=0.0, counters_ready=True)
     db.add(analysis)
     db.flush()
     return analysis
@@ -228,52 +230,156 @@ def refresh_statistics(db: Session, analysis: Analysis) -> None:
     analysis.error_rate = summary["error_rate"]
 
 
-# --------------------------------------------------------------------------- findings (incremental)
+# --------------------------------------------------------------------------- findings
 
-def _rule_total(db: Session, analysis_id: int, rule: str, ip: str | None) -> int:
-    """Exact number of matching records in the whole analysis for one rule and IP."""
-    where = [LogEntry.analysis_id == analysis_id]
+_STREAM_BATCH = 5000
+# SQL pre-filter for failed logins: a superset of project.is_failed_login, refined in Python.
+_LOGIN_HINTS = ("%fail%", "%invalid%", "%unsuccessful%", "%bad%")
+
+
+def _group_rows(db: Session, analysis_id: int, rule: str):
+    """Yield (ip, naive timestamp) of the records a rule counts, sorted by ip then time.
+
+    Rows are streamed from SQLite in batches, so memory does not grow with the log.
+    """
+    of_analysis = LogEntry.analysis_id == analysis_id
     if rule == "server_error_spike":
-        where.append(LogEntry.status.between(500, 599))
-    elif rule == "excessive_404":
-        where += [LogEntry.ip == ip, LogEntry.status == 404]
-    elif rule == "high_volume":
-        where.append(LogEntry.ip == ip)
-    else:  # brute_force: the failed-login test needs Python, but only for this IP
-        return sum(1 for entry in load_entries(db, analysis_id, ip=ip) if is_failed_login(entry))
-    return db.scalar(select(func.count()).where(*where)) or 0
+        query = (select(LogEntry.timestamp).where(of_analysis, LogEntry.status.between(500, 599))
+                 .order_by(LogEntry.timestamp))
+        for (moment,) in db.execute(query.execution_options(yield_per=_STREAM_BATCH)):
+            yield None, _naive(moment)
+        return
+    with_ip = [of_analysis, LogEntry.ip.is_not(None), LogEntry.ip != ""]
+    if rule == "brute_force":
+        hints = or_(LogEntry.status.in_((401, 403)), *(LogEntry.message.like(h) for h in _LOGIN_HINTS))
+        query = (select(LogEntry.ip, LogEntry.timestamp, LogEntry.endpoint, LogEntry.status, LogEntry.message)
+                 .where(*with_ip, hints).order_by(LogEntry.ip, LogEntry.timestamp))
+        for ip, moment, endpoint, status, message in db.execute(query.execution_options(yield_per=_STREAM_BATCH)):
+            if is_failed_login({"endpoint": endpoint, "status": status, "message": message}):
+                yield ip, _naive(moment)
+        return
+    if rule == "excessive_404":
+        with_ip.append(LogEntry.status == 404)
+    query = select(LogEntry.ip, LogEntry.timestamp).where(*with_ip).order_by(LogEntry.ip, LogEntry.timestamp)
+    for ip, moment in db.execute(query.execution_options(yield_per=_STREAM_BATCH)):
+        yield ip, _naive(moment)
+
+
+def _stream_peaks(rows, window_seconds: int):
+    """Busiest window per key from rows sorted by (key, time).
+
+    Same result as ``project.peak_window`` per group, but keeps only the
+    current window in memory. Yields ``(key, total, (count, first, last))``.
+    """
+    sentinel = object()
+    current, window, best, total = sentinel, deque(), (0, None, None), 0
+    for key, moment in rows:
+        if key != current:
+            if total:
+                yield current, total, best
+            current, window, best, total = key, deque(), (0, None, None), 0
+        total += 1
+        window.append(moment)
+        while (moment - window[0]).total_seconds() > window_seconds:
+            window.popleft()
+        if len(window) > best[0]:
+            best = (len(window), window[0], moment)
+    if total:
+        yield current, total, best
+
+
+def scan_detections(
+    db: Session, analysis_id: int, thresholds: dict[str, dict[str, int]],
+) -> tuple[list[dict[str, Any]], dict[tuple[str, str | None], int]]:
+    """Full detection over a stored analysis without loading it into memory.
+
+    Returns the detections (same as ``project.detect_suspicious_activity``)
+    and the number of matching records per (rule, ip) group.
+    """
+    config = {rule: {**cfg, **(thresholds or {}).get(rule, {})} for rule, cfg in DEFAULT_THRESHOLDS.items()}
+    detections, totals = [], {}
+    for rule, settings in config.items():
+        for key, total, (count, first, last) in _stream_peaks(_group_rows(db, analysis_id, rule),
+                                                              settings["window_seconds"]):
+            totals[(rule, key)] = total
+            if detection := make_detection(rule, key, count, first, last, total, settings):
+                detections.append(detection)
+    detections.sort(key=lambda d: (SEVERITY_ORDER[d["severity"]], -d["count"], d["rule"]))
+    return detections, totals
+
+
+def _replace_findings(db: Session, analysis: Analysis, thresholds: dict[str, dict[str, int]]) -> int:
+    """Recompute all findings and running counters of an analysis (streaming)."""
+    detections, totals = scan_detections(db, analysis.id, thresholds)
+    db.execute(delete(Detection).where(Detection.analysis_id == analysis.id))
+    _store_detections(db, analysis.id, detections)
+    db.execute(delete(RuleCount).where(RuleCount.analysis_id == analysis.id))
+    if totals:
+        db.execute(insert(RuleCount), [
+            {"analysis_id": analysis.id, "rule": rule, "key": key or "", "count": count}
+            for (rule, key), count in totals.items()
+        ])
+    analysis.counters_ready = True
+    analysis.detection_count = len(detections)
+    return len(detections)
+
+
+def _add_to_counters(db: Session, analysis_id: int, added: Counter) -> dict[tuple[str, str | None], int]:
+    """Add new matches to the running counters and return the updated totals."""
+    rows = [{"analysis_id": analysis_id, "rule": rule, "key": key or "", "count": n}
+            for (rule, key), n in added.items()]
+    statement = sqlite_insert(RuleCount)
+    db.execute(statement.on_conflict_do_update(
+        index_elements=["analysis_id", "rule", "key"],
+        set_={"count": RuleCount.count + statement.excluded["count"]},
+    ), rows)
+    totals = {}
+    groups = [(rule, key or "") for rule, key in added]
+    for start in range(0, len(groups), 400):  # keep the SQL parameter list small
+        part = groups[start:start + 400]
+        for rule, key, count in db.execute(
+            select(RuleCount.rule, RuleCount.key, RuleCount.count)
+            .where(RuleCount.analysis_id == analysis_id, tuple_(RuleCount.rule, RuleCount.key).in_(part))
+        ):
+            totals[(rule, key or None)] = count
+    return totals
 
 
 def update_detections(db: Session, analysis: Analysis, new_entries: list[dict[str, Any]]) -> None:
     """Update findings after ``new_entries`` were stored, without rescanning the whole log.
 
     A busiest window that contains a new record lies within one rule window of
-    the new records' time range, so only that slice is loaded and re-checked.
-    For each rule and IP the larger peak (old or new) is kept; totals are
-    recounted exactly for the affected groups only.
+    the new records' time range, so only that slice is re-checked. For each
+    rule and IP the larger peak (old or new) is kept. Totals come from running
+    counters that are increased by the new records only.
     """
-    dated = [entry["timestamp"] for entry in new_entries if entry.get("timestamp")]
-    if not dated:
-        return
     thresholds = {rule: {**cfg, **(analysis.thresholds or {}).get(rule, {})} for rule, cfg in DEFAULT_THRESHOLDS.items()}
-    reach = timedelta(seconds=max(cfg["window_seconds"] for cfg in thresholds.values()))
-    window_slice = load_entries(db, analysis.id, start=min(dated) - reach, end=max(dated) + reach)
+    if not analysis.counters_ready:
+        # Analyses from older versions or uploads: build findings and counters once.
+        _replace_findings(db, analysis, thresholds)
+        return
+    dated = [entry["timestamp"] for entry in new_entries if entry.get("timestamp")]
+    added = Counter(group for entry in new_entries for group in classify_entry(entry))
+    if not dated or not added:
+        return
+    totals = _add_to_counters(db, analysis.id, added)
 
+    reach = timedelta(seconds=max(cfg["window_seconds"] for cfg in thresholds.values()))
     times: dict[tuple[str, str | None], list[datetime]] = {}
-    affected = {group for entry in new_entries for group in classify_entry(entry)}
-    for entry in sorted(window_slice, key=lambda e: e["timestamp"]):
+    for entry in sorted(load_entries(db, analysis.id, start=min(dated) - reach, end=max(dated) + reach),
+                        key=lambda e: e["timestamp"]):
         for group in classify_entry(entry):
-            if group in affected:
+            if group in added:
                 times.setdefault(group, []).append(entry["timestamp"])
 
     existing = {(d.rule, d.ip): d for d in db.scalars(select(Detection).where(Detection.analysis_id == analysis.id))}
-    for rule, ip in affected:
+    for rule, ip in added:
         settings = thresholds[rule]
         count, first, last = peak_window(times.get((rule, ip), []), settings["window_seconds"])
         old = existing.get((rule, ip))
         if old is not None and old.count >= count:
             count, first, last = old.count, _naive(old.first_seen), _naive(old.last_seen)
-        detection = make_detection(rule, ip, count, first, last, _rule_total(db, analysis.id, rule, ip), settings)
+        detection = make_detection(rule, ip, count, first, last, totals.get((rule, ip), 0), settings)
         if detection is None:
             continue
         if old is None:
@@ -286,12 +392,9 @@ def update_detections(db: Session, analysis: Analysis, new_entries: list[dict[st
 
 
 def refresh_analysis(db: Session, analysis: Analysis) -> None:
-    """Full recomputation of statistics and findings (used after rule changes)."""
+    """Full recomputation of statistics and findings (streaming, constant memory)."""
     refresh_statistics(db, analysis)
-    detections = detect_suspicious_activity(load_entries(db, analysis.id), analysis.thresholds or saved_thresholds(db))
-    db.execute(delete(Detection).where(Detection.analysis_id == analysis.id))
-    _store_detections(db, analysis.id, detections)
-    analysis.detection_count = len(detections)
+    _replace_findings(db, analysis, analysis.thresholds or saved_thresholds(db))
 
 
 # --------------------------------------------------------------------------- recurring issues (SQL)
@@ -333,17 +436,12 @@ def recurring_issues(db: Session, analysis_id: int, limit: int | None = 20, min_
 
 
 def rerun_detection(db: Session, analysis: Analysis, thresholds: dict[str, dict[str, int]]) -> int:
-    """Re-run detection for a stored analysis with custom thresholds."""
-    # The core functions work on naive UTC datetimes (see project.py), while
-    # the database returns aware UTC values, so drop the tzinfo (no shift).
-    detections = detect_suspicious_activity(load_entries(db, analysis.id), thresholds)
-    db.execute(delete(Detection).where(Detection.analysis_id == analysis.id))
-    _store_detections(db, analysis.id, detections)
+    """Re-run detection for a stored analysis with custom thresholds (streaming)."""
     merged = {rule: {**DEFAULT_THRESHOLDS[rule], **thresholds.get(rule, {})} for rule in DEFAULT_THRESHOLDS}
     analysis.thresholds = merged
-    analysis.detection_count = len(detections)
+    count = _replace_findings(db, analysis, merged)
     db.commit()
-    return len(detections)
+    return count
 
 
 THRESHOLDS_KEY = "detection_thresholds"
@@ -455,5 +553,6 @@ def delete_analysis(db: Session, analysis: Analysis) -> None:
     # A monitored file keeps being watched; its next new lines start a fresh analysis.
     db.execute(delete(LogEntry).where(LogEntry.analysis_id == analysis.id))
     db.execute(delete(Detection).where(Detection.analysis_id == analysis.id))
+    db.execute(delete(RuleCount).where(RuleCount.analysis_id == analysis.id))
     db.delete(analysis)
     db.commit()

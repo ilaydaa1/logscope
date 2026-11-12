@@ -23,6 +23,7 @@
         </span>
       {% endif %}
       <span class="status-error" data-field="last_error" {{ 'hidden' if not ms.last_error }}>{{ ms.last_error or "" }}</span>
+      {% if ms.offline_gap %}<span class="status-note">{{ ms.offline_gap }}</span>{% endif %}
     </div>
   </div>
   <a class="btn btn-sm" href="/monitor">{{ "Set up" if ms.state == "stopped" else "Manage" }}</a>

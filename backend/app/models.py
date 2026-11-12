@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -26,6 +26,8 @@ class Analysis(Base):
     error_rate: Mapped[float] = mapped_column(default=0.0)
     summary: Mapped[dict] = mapped_column(JSON, default=dict)  # output of analyze_log_entries
     thresholds: Mapped[dict] = mapped_column(JSON, default=dict)  # rules used for detection
+    # True once RuleCount holds running totals for this analysis (see analysis_service).
+    counters_ready: Mapped[bool | None] = mapped_column(default=False, nullable=True)
 
     entries: Mapped[list[LogEntry]] = relationship(
         back_populates="analysis", cascade="all, delete-orphan", passive_deletes=True
@@ -37,16 +39,23 @@ class Analysis(Base):
 
 class LogEntry(Base):
     __tablename__ = "log_entries"
+    # Every query filters by analysis first, so the indexes start with analysis_id.
+    __table_args__ = (
+        Index("ix_entries_analysis_time", "analysis_id", "timestamp"),
+        Index("ix_entries_analysis_ip_time", "analysis_id", "ip", "timestamp"),
+        Index("ix_entries_analysis_status", "analysis_id", "status"),
+        Index("ix_entries_analysis_level_pattern", "analysis_id", "level", "pattern"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    analysis_id: Mapped[int] = mapped_column(ForeignKey("analyses.id", ondelete="CASCADE"), index=True)
+    analysis_id: Mapped[int] = mapped_column(ForeignKey("analyses.id", ondelete="CASCADE"))
     line_number: Mapped[int] = mapped_column(Integer)
-    timestamp: Mapped[datetime] = mapped_column(UTCDateTime, index=True)  # event time from the log
-    level: Mapped[str] = mapped_column(String(10), index=True)
-    ip: Mapped[str | None] = mapped_column(String(45), nullable=True, index=True)
+    timestamp: Mapped[datetime] = mapped_column(UTCDateTime)  # event time from the log
+    level: Mapped[str] = mapped_column(String(10))
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     method: Mapped[str | None] = mapped_column(String(10), nullable=True)
     endpoint: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    status: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     message: Mapped[str] = mapped_column(Text, default="")
     # Recurring-issue key (project.recurring_key) for WARNING/ERROR/CRITICAL records,
     # stored once at insert time so recurring issues are a cheap GROUP BY.
@@ -109,3 +118,20 @@ class WatchedFile(Base):
     tail_hash: Mapped[str] = mapped_column(String(64), default="")
     encoding: Mapped[str] = mapped_column(String(20), default="")       # utf-8, utf-16-le, utf-16-be
     parser_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # e.g. W3C #Fields
+
+
+class RuleCount(Base):
+    """Running number of matching records per detection rule and IP ('' = all clients).
+
+    Lets monitored files update finding totals with only the new records
+    instead of recounting the whole log.
+    """
+
+    __tablename__ = "rule_counts"
+    __table_args__ = (UniqueConstraint("analysis_id", "rule", "key", name="uq_rule_counts"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    analysis_id: Mapped[int] = mapped_column(ForeignKey("analyses.id", ondelete="CASCADE"))
+    rule: Mapped[str] = mapped_column(String(40))
+    key: Mapped[str] = mapped_column(String(45), default="")
+    count: Mapped[int] = mapped_column(Integer, default=0)
